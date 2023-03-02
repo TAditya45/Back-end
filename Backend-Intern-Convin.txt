@@ -7,6 +7,7 @@ from django.views import View
 from google.oauth2.credentials import Credentials
 from google.auth.transport import requests as google_requests
 from google_auth_oauthlib.flow import Flow
+from googleapiclient.errors import HttpError
 from googleapiclient.discovery import build
 
 
@@ -34,17 +35,18 @@ class GoogleCalendarInitView(View):
             prompt='consent',
         )
 
-        request.session['state'] = state
+        request.session['oauth2_state'] = state
         return HttpResponseRedirect(authorization_url)
 
 
 class GoogleCalendarRedirectView(View):
     def get(self, request):
-        if 'error' in request.GET:
-            return HttpResponseBadRequest(request.GET['error'])
+        error = request.GET.get('error')
+        if error:
+            return HttpResponseBadRequest(error)
 
-        state = request.session.pop('state', None)
-        if state is None or state != request.GET.get('state'):
+        oauth2_state = request.session.pop('oauth2_state', None)
+        if oauth2_state != request.GET.get('state'):
             return HttpResponseBadRequest('Invalid state parameter')
 
         flow = Flow.from_client_secrets_file(
@@ -53,22 +55,27 @@ class GoogleCalendarRedirectView(View):
             redirect_uri=request.build_absolute_uri(reverse('google_calendar_redirect')),
         )
 
-        flow.fetch_token(authorization_response=request.build_absolute_uri(),
-                         access_type='offline')
+        try:
+            flow.fetch_token(authorization_response=request.build_absolute_uri())
+        except Exception as e:
+            return HttpResponseBadRequest(f"Error getting access token: {e}")
 
         credentials = flow.credentials
-        request.session['credentials'] = credentials_to_dict(credentials)
+        request.session['oauth2_credentials'] = credentials_to_dict(credentials)
 
-        service = build('calendar', 'v3', credentials=credentials)
-        events_result = service.events().list(calendarId='primary', maxResults=10, singleEvents=True, orderBy='startTime').execute()
-        events = events_result.get('items', [])
+        try:
+            service = build('calendar', 'v3', credentials=credentials)
+            events_result = service.events().list(calendarId='primary', maxResults=10, singleEvents=True, orderBy='startTime').execute()
+            events = events_result.get('items', [])
 
-        if not events:
-            return JsonResponse({'message': 'No events found.'})
+            if not events:
+                return JsonResponse({'message': 'No events found.'})
 
-        event_list = []
-        for event in events:
-            start = event['start'].get('dateTime', event['start'].get('date'))
-            event_list.append({'summary': event['summary'], 'start': start})
+            event_list = []
+            for event in events:
+                start = event['start'].get('dateTime', event['start'].get('date'))
+                event_list.append({'summary': event['summary'], 'start': start})
 
-        return JsonResponse({'events': event_list})
+            return JsonResponse({'events': event_list})
+        except HttpError as error:
+            return HttpResponseBadRequest(f"An error occurred: {error}")
